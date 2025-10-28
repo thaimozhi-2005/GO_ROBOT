@@ -25,6 +25,7 @@ type Admin struct {
 type Bot struct {
 	ID              uint      `gorm:"primaryKey"`
 	BotUsername     string    `gorm:"type:varchar(100);not null"`
+	BotURL          string    `gorm:"type:varchar(500)"` // HTTP URL to ping
 	IntervalMinutes int       `gorm:"default:5"`
 	LastPing        time.Time
 	Status          string    `gorm:"type:varchar(20);default:'Unknown'"`
@@ -169,8 +170,8 @@ func handleHelp(c tele.Context) error {
 
 	helpText := `📖 Available Commands:
 
-/addbot <username> <interval> - Add bot to monitor
-   Example: /addbot @mybot 5
+/addbot <username> <url> <interval> - Add bot to monitor
+   Example: /addbot @mybot https://mybot.onrender.com 5
 
 /removebot <username> - Remove bot from monitoring
    Example: /removebot @mybot
@@ -193,14 +194,20 @@ func handleAddBot(c tele.Context) error {
 	}
 
 	args := strings.Fields(c.Text())
-	if len(args) < 3 {
-		return c.Send("❌ Usage: /addbot <username> <interval_minutes>\nExample: /addbot @mybot 5")
+	if len(args) < 4 {
+		return c.Send("❌ Usage: /addbot <username> <url> <interval_minutes>\nExample: /addbot @mybot https://mybot.onrender.com 5")
 	}
 
 	username := strings.TrimPrefix(args[1], "@")
-	interval, err := strconv.Atoi(args[2])
+	botURL := args[2]
+	interval, err := strconv.Atoi(args[3])
 	if err != nil || interval < 1 {
 		return c.Send("❌ Invalid interval. Must be a positive number.")
+	}
+
+	// Validate URL
+	if !strings.HasPrefix(botURL, "http://") && !strings.HasPrefix(botURL, "https://") {
+		return c.Send("❌ Invalid URL. Must start with http:// or https://")
 	}
 
 	// Check if bot already exists
@@ -213,6 +220,7 @@ func handleAddBot(c tele.Context) error {
 	// Add new bot
 	newBot := Bot{
 		BotUsername:     username,
+		BotURL:          botURL,
 		IntervalMinutes: interval,
 		Status:          "Unknown",
 		AddedBy:         c.Sender().ID,
@@ -221,7 +229,7 @@ func handleAddBot(c tele.Context) error {
 
 	db.Create(&newBot)
 
-	return c.Send(fmt.Sprintf("✅ Bot @%s added successfully!\nPing interval: %d minutes", username, interval))
+	return c.Send(fmt.Sprintf("✅ Bot @%s added successfully!\nURL: %s\nPing interval: %d minutes", username, botURL, interval))
 }
 
 // Handler: /removebot
@@ -267,8 +275,8 @@ func handleListBots(c tele.Context) error {
 			statusEmoji = "❌"
 		}
 
-		message += fmt.Sprintf("%d. @%s %s\n   Interval: %d min | Last Ping: %s\n\n",
-			i+1, b.BotUsername, statusEmoji, b.IntervalMinutes,
+		message += fmt.Sprintf("%d. @%s %s\n   URL: %s\n   Interval: %d min | Last Ping: %s\n\n",
+			i+1, b.BotUsername, statusEmoji, b.BotURL, b.IntervalMinutes,
 			b.LastPing.Format("02 Jan 15:04"))
 	}
 
@@ -360,19 +368,31 @@ func startScheduler() {
 
 // Send keep-alive ping to bot
 func sendKeepAlivePing(b Bot) {
-	log.Printf("📡 Pinging @%s...", b.BotUsername)
+	log.Printf("📡 Pinging @%s at %s...", b.BotUsername, b.BotURL)
 
-	// Try to send a message to the bot
-	recipient := &tele.User{Username: b.BotUsername}
-	_, err := bot.Send(recipient, "/start")
+	// Create HTTP client with timeout
+	client := &http.Client{
+		Timeout: 30 * time.Second,
+	}
 
-	success := err == nil
-	status := "Online"
-	if !success {
-		status = "Offline"
-		log.Printf("❌ Failed to ping @%s: %v", b.BotUsername, err)
+	// Try to ping the bot's URL
+	resp, err := client.Get(b.BotURL)
+	
+	success := false
+	status := "Offline"
+
+	if err == nil {
+		defer resp.Body.Close()
+		// Consider 2xx and 3xx as success
+		if resp.StatusCode >= 200 && resp.StatusCode < 400 {
+			success = true
+			status = "Online"
+			log.Printf("✅ Successfully pinged @%s (Status: %d)", b.BotUsername, resp.StatusCode)
+		} else {
+			log.Printf("⚠️ Bot @%s responded with status %d", b.BotUsername, resp.StatusCode)
+		}
 	} else {
-		log.Printf("✅ Successfully pinged @%s", b.BotUsername)
+		log.Printf("❌ Failed to ping @%s: %v", b.BotUsername, err)
 	}
 
 	// Update bot status and last ping time
@@ -386,6 +406,24 @@ func sendKeepAlivePing(b Bot) {
 		BotID:  b.ID,
 		Result: success,
 	})
+
+	// Alert admin if bot goes offline
+	if !success {
+		notifyAdminOffline(b)
+	}
+}
+
+// Notify admin when bot goes offline
+func notifyAdminOffline(b Bot) {
+	var admin Admin
+	db.Where("telegram_id = ?", b.AddedBy).First(&admin)
+	
+	if admin.TelegramID != 0 {
+		recipient := &tele.User{ID: admin.TelegramID}
+		message := fmt.Sprintf("⚠️ Alert: Bot @%s is OFFLINE!\n\nURL: %s\nLast successful ping: %s",
+			b.BotUsername, b.BotURL, b.LastPing.Format("02 Jan 2006 15:04"))
+		bot.Send(recipient, message)
+	}
 }
 
 // HTTP Server for Render health checks
